@@ -1,0 +1,22 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# Virtual environment 
+venv/
+*.venv/
+env/
+
+# Local Database file 
+*.db
+*.db-journal # SQLite temporary file
+
+# Secrets file 
+.env
+secrets.txt
+
+#google updater api key
+musicdashboard-458520-4318d2e00083.json
+
+#log files
+*.log
