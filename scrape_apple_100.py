@@ -14,7 +14,7 @@ PLATFORM_NAME_MUSIC = "AppleMusic"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-DB_FILENAME = "music_charts.db" # Still using music_charts.db
+DB_FILENAME = "music_charts.db"
 DB_PATH = os.path.join(DATA_DIR, DB_FILENAME)
 
 LOG_LEVEL = logging.INFO
@@ -35,6 +35,9 @@ REGION_CODES = [
     'tw', 'tj', 'tz', 'th', 'to', 'tt', 'tn', 'tm', 'tc', 'tr', 'ae', 'ug',
     'ua', 'gb', 'us', 'uy', 'uz', 'vu', 've', 'vn', 'ye', 'zm', 'zw'
 ]
+
+# Genre ID to exclude from MusicGenres linking
+EXCLUDE_GENRE_ID = 34 # ID for "Music"
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -60,13 +63,6 @@ def scrape_apple_music_charts(region: str) -> List[Dict[str, Any]]:
     """
     Scrapes the top 100 most played songs for a given region from Apple Music API.
     Includes the parsed genre list in the returned dictionary.
-
-    Args:
-        region: The two-letter country code.
-
-    Returns:
-        A list of song record dictionaries, or an empty list on failure.
-        Each dictionary includes a 'parsed_genres' key containing the list of genre dicts.
     """
     url = APPLE_MUSIC_API_URL_TEMPLATE.format(region=region)
     logging.info(f"Requesting Apple Music chart data for region '{region}' from: {url}")
@@ -95,7 +91,6 @@ def scrape_apple_music_charts(region: str) -> List[Dict[str, Any]]:
                   logging.warning(f"[{region}] Skipping item at rank {rank}, expected dict, got {type(song_data)}")
                   continue
 
-             # *** Get the parsed genre list directly ***
              genres_list = song_data.get("genres", [])
 
              records.append({
@@ -108,7 +103,7 @@ def scrape_apple_music_charts(region: str) -> List[Dict[str, Any]]:
                  "apple_artist_id": song_data.get("artistId"),
                  "release_date": song_data.get("releaseDate"),
                  "artwork_url": song_data.get("artworkUrl100"),
-                 "parsed_genres": genres_list, # <-- Store the list here
+                 "parsed_genres": genres_list,
                  "song_url": song_data.get("url"),
                  "date": today
              })
@@ -127,11 +122,9 @@ def scrape_apple_music_charts(region: str) -> List[Dict[str, Any]]:
 
 def save_music_data_to_db(records: List[Dict[str, Any]], db_path: str):
     """
-    Saves scraped music chart records to the SQLite database, normalizing genres.
-
-    Args:
-        records: List of song dictionaries (including 'parsed_genres' key).
-        db_path: Path to the SQLite database file.
+    Saves scraped music chart records to the SQLite database, normalizing genres, artists, and songs.
+    Ensures only the MIN (alphabetical) name for artists and songs is stored for a given ID.
+    Excludes linking genre_id 34 ("Music") in MusicGenres.
     """
     if not records:
         logging.warning("No records provided to save.")
@@ -146,134 +139,147 @@ def save_music_data_to_db(records: List[Dict[str, Any]], db_path: str):
     cursor = None
     try:
         conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA foreign_keys = ON;") # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys = ON;")
         cursor = conn.cursor()
 
-        # --- Define Schemas ---
-        # MusicTop100 table (NO genres column)
+        # Schemas (MusicTop100, Artists, Songs, Genres, MusicGenres - definitions as in previous answer)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS MusicTop100 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform TEXT NOT NULL,
-                region TEXT NOT NULL,
-                rank INTEGER NOT NULL,
-                song_title TEXT,
-                artist_name TEXT,
-                apple_song_id TEXT, -- Used to link to genres
-                apple_artist_id TEXT,
-                release_date TEXT,
-                artwork_url TEXT,
-                -- genres TEXT column REMOVED
-                song_url TEXT,
-                date TEXT NOT NULL,
-                UNIQUE(platform, region, rank, date)
-            )
+                id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, region TEXT NOT NULL,
+                rank INTEGER NOT NULL, apple_song_id TEXT, apple_artist_id TEXT,
+                release_date TEXT, artwork_url TEXT, song_url TEXT, date TEXT NOT NULL,
+                UNIQUE(platform, region, rank, date) )
         ''')
-        # Genres lookup table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Artists (
+                apple_artist_id TEXT PRIMARY KEY, artist_name TEXT NOT NULL )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS Songs (
+                apple_song_id TEXT PRIMARY KEY, song_title TEXT NOT NULL )
+        ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS Genres (
-                genre_id INTEGER PRIMARY KEY, -- Use Apple's genreId
-                genre_name TEXT NOT NULL UNIQUE,
-                genre_url TEXT -- Optional URL from Apple
-            )
+                genre_id INTEGER PRIMARY KEY, genre_name TEXT NOT NULL UNIQUE, genre_url TEXT )
         ''')
-        # MusicGenres junction table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS MusicGenres (
-                apple_song_id TEXT NOT NULL, -- Links to MusicTop100
-                genre_id INTEGER NOT NULL,   -- Links to Genres
+                apple_song_id TEXT NOT NULL, genre_id INTEGER NOT NULL,
                 PRIMARY KEY (apple_song_id, genre_id),
-                -- Optional FKs (cannot strictly enforce on apple_song_id if not PK/UNIQUE in MusicTop100)
-                FOREIGN KEY (genre_id) REFERENCES Genres(genre_id) ON DELETE CASCADE
-            )
+                FOREIGN KEY (genre_id) REFERENCES Genres(genre_id) ON DELETE CASCADE )
         ''')
-        # Optional indexes
+        # Indexes (as in previous answer)
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_music_lookup ON MusicTop100 (platform, region, date, rank);')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_music_song_id ON MusicTop100 (apple_song_id);') # Index song ID
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_music_song_id_main ON MusicTop100 (apple_song_id);')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_music_artist_id_main ON MusicTop100 (apple_artist_id);')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_artists_apple_id ON Artists (apple_artist_id);')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_songs_apple_id ON Songs (apple_song_id);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_musicgenres_song ON MusicGenres (apple_song_id);')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_musicgenres_genre ON MusicGenres (genre_id);')
 
-        conn.commit() # Commit schema changes
+        conn.commit()
 
-        # --- Insert Data Loop ---
-        insert_count_songs = 0
-        insert_count_genres = 0
-        insert_count_links = 0
+        insert_count_charts = 0
+        insert_count_artists_new = 0; insert_count_artists_updated = 0
+        insert_count_songs_new = 0; insert_count_songs_updated = 0
+        insert_count_genres = 0; insert_count_links = 0
         processed_records = 0
 
         logging.info(f"Processing {len(records)} records for database insertion...")
 
         for r in records:
             processed_records += 1
-            if processed_records % 100 == 0: # Log progress every 100 records
-                logging.info(f"Processed {processed_records}/{len(records)} records...")
+            if processed_records % 250 == 0:
+                logging.info(f"Processed {processed_records}/{len(records)} records for DB...")
 
-            # Extract main song data
-            song_data_tuple = (
-                r.get("platform"), r.get("region"), r.get("rank"), r.get("song_title"),
-                r.get("artist_name"), r.get("apple_song_id"), r.get("apple_artist_id"),
+            apple_artist_id_val = r.get("apple_artist_id")
+            artist_name_val = r.get("artist_name")
+            apple_song_id_val = r.get("apple_song_id")
+            song_title_val = r.get("song_title")
+
+            # Artist handling (MIN name logic)
+            if apple_artist_id_val and artist_name_val:
+                try:
+                    cursor.execute("SELECT artist_name FROM Artists WHERE apple_artist_id = ?", (apple_artist_id_val,))
+                    existing_row = cursor.fetchone()
+                    if existing_row:
+                        if artist_name_val < existing_row[0]:
+                            cursor.execute('UPDATE Artists SET artist_name = ? WHERE apple_artist_id = ?', (artist_name_val, apple_artist_id_val))
+                            if cursor.rowcount > 0: insert_count_artists_updated += 1
+                    else:
+                        cursor.execute('INSERT INTO Artists (apple_artist_id, artist_name) VALUES (?, ?)', (apple_artist_id_val, artist_name_val))
+                        if cursor.rowcount > 0: insert_count_artists_new += 1
+                except sqlite3.Error as e_artist:
+                    logging.error(f"DB error processing artist {apple_artist_id_val}/{artist_name_val}: {e_artist}")
+
+            # Song handling (MIN title logic)
+            if apple_song_id_val and song_title_val:
+                try:
+                    cursor.execute("SELECT song_title FROM Songs WHERE apple_song_id = ?", (apple_song_id_val,))
+                    existing_row = cursor.fetchone()
+                    if existing_row:
+                        if song_title_val < existing_row[0]:
+                            cursor.execute('UPDATE Songs SET song_title = ? WHERE apple_song_id = ?', (song_title_val, apple_song_id_val))
+                            if cursor.rowcount > 0: insert_count_songs_updated += 1
+                    else:
+                        cursor.execute('INSERT INTO Songs (apple_song_id, song_title) VALUES (?, ?)', (apple_song_id_val, song_title_val))
+                        if cursor.rowcount > 0: insert_count_songs_new += 1
+                except sqlite3.Error as e_song_meta:
+                    logging.error(f"DB error processing song metadata {apple_song_id_val}/{song_title_val}: {e_song_meta}")
+
+            chart_data_tuple = (
+                r.get("platform"), r.get("region"), r.get("rank"),
+                apple_song_id_val, apple_artist_id_val,
                 r.get("release_date"), r.get("artwork_url"),
                 r.get("song_url"), r.get("date")
             )
-            apple_song_id = r.get("apple_song_id") # Needed for linking
-
-            # Extract parsed genres
             genres_list = r.get("parsed_genres", [])
 
             try:
-                # Insert/Ignore main song data
                 cursor.execute('''
                     INSERT OR IGNORE INTO MusicTop100 (
-                        platform, region, rank, song_title, artist_name, apple_song_id,
+                        platform, region, rank, apple_song_id,
                         apple_artist_id, release_date, artwork_url, song_url, date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', song_data_tuple)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', chart_data_tuple)
                 if cursor.rowcount > 0:
-                    insert_count_songs += 1
+                    insert_count_charts += 1
 
-                # Process genres if song ID exists and genres list is valid
-                if apple_song_id and isinstance(genres_list, list):
+                # Process genres
+                if apple_song_id_val and isinstance(genres_list, list):
                     for genre_dict in genres_list:
-                        if not isinstance(genre_dict, dict): continue # Skip invalid genre entries
-
+                        if not isinstance(genre_dict, dict): continue
                         genre_id_str = genre_dict.get("genreId")
                         genre_name = genre_dict.get("name")
                         genre_url = genre_dict.get("url")
-
-                        if not genre_id_str or not genre_name: continue # Skip if missing ID or Name
-
+                        if not genre_id_str or not genre_name: continue
                         try:
-                            genre_id = int(genre_id_str) # Convert ID to integer
+                            genre_id = int(genre_id_str)
 
-                            # Insert/Ignore into Genres table
-                            cursor.execute('''
-                                INSERT OR IGNORE INTO Genres (genre_id, genre_name, genre_url)
-                                VALUES (?, ?, ?)
-                            ''', (genre_id, genre_name, genre_url))
-                            if cursor.rowcount > 0:
-                                insert_count_genres += 1
+                            # Insert/Ignore into Genres table (still add "Music" here if it appears)
+                            cursor.execute('INSERT OR IGNORE INTO Genres (genre_id, genre_name, genre_url) VALUES (?, ?, ?)',(genre_id, genre_name, genre_url))
+                            if cursor.rowcount > 0: insert_count_genres += 1
 
-                            # Insert/Ignore into MusicGenres link table
-                            cursor.execute('''
-                                INSERT OR IGNORE INTO MusicGenres (apple_song_id, genre_id)
-                                VALUES (?, ?)
-                            ''', (apple_song_id, genre_id))
-                            if cursor.rowcount > 0:
-                                insert_count_links += 1
+                            # *** MODIFIED: Only link if genre_id is NOT the one to exclude ***
+                            if genre_id != EXCLUDE_GENRE_ID:
+                                cursor.execute('INSERT OR IGNORE INTO MusicGenres (apple_song_id, genre_id) VALUES (?, ?)',(apple_song_id_val, genre_id))
+                                if cursor.rowcount > 0:
+                                    insert_count_links += 1
+                            else:
+                                logging.debug(f"Skipping link for genre_id {EXCLUDE_GENRE_ID} ('Music') for song {apple_song_id_val}.")
 
                         except ValueError:
-                             logging.warning(f"Invalid genre_id format '{genre_id_str}' for song {apple_song_id}. Skipping genre link.")
+                             logging.warning(f"Invalid genre_id format '{genre_id_str}' for song {apple_song_id_val}. Skipping.")
                         except sqlite3.Error as e_genre:
-                            logging.error(f"DB error processing genre {genre_id_str}/{genre_name} for song {apple_song_id}: {e_genre}")
+                            logging.error(f"DB error processing genre {genre_id_str}/{genre_name} for song {apple_song_id_val}: {e_genre}")
 
-            except sqlite3.Error as e_song:
-                 logging.error(f"DB error inserting main data for record: {r} - Error: {e_song}")
+            except sqlite3.Error as e_chart:
+                 logging.error(f"DB error inserting chart data for song ID {apple_song_id_val}: {e_chart}")
             except Exception as e_rec:
-                 logging.error(f"Unexpected error processing record {r}: {e_rec}", exc_info=True)
+                 logging.error(f"Unexpected error processing chart record for song ID {apple_song_id_val}: {e_rec}", exc_info=True)
 
-
-        conn.commit() # Commit all changes after processing all records
-        logging.info(f"Database save operation complete. Song rows ignored/inserted: {insert_count_songs}/{processed_records}. New Genres added: {insert_count_genres}. New Song-Genre links added: {insert_count_links}.")
+        conn.commit()
+        logging.info(f"Database save complete. Chart rows processed: {insert_count_charts}. New Artists: {insert_count_artists_new}, Artists updated: {insert_count_artists_updated}. New Songs: {insert_count_songs_new}, Song titles updated: {insert_count_songs_updated}. New Genres: {insert_count_genres}. New Song-Genre links added: {insert_count_links}.")
 
     except sqlite3.Error as e:
         logging.error(f"Database error accessing {db_path}: {e}", exc_info=True)
@@ -287,6 +293,22 @@ def save_music_data_to_db(records: List[Dict[str, Any]], db_path: str):
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
+    # --- Optional: One-time cleanup of existing genre_id 34 links ---
+    # conn_cleanup = None
+    # try:
+    #     logging.info(f"Attempting one-time cleanup of genre_id {EXCLUDE_GENRE_ID} from MusicGenres...")
+    #     conn_cleanup = sqlite3.connect(DB_PATH)
+    #     cursor_cleanup = conn_cleanup.cursor()
+    #     cursor_cleanup.execute(f"DELETE FROM MusicGenres WHERE genre_id = ?", (EXCLUDE_GENRE_ID,))
+    #     conn_cleanup.commit()
+    #     logging.info(f"Deleted {cursor_cleanup.rowcount} existing links for genre_id {EXCLUDE_GENRE_ID}.")
+    #     cursor_cleanup.close()
+    # except sqlite3.Error as e_cleanup:
+    #     logging.error(f"Error during one-time cleanup of MusicGenres: {e_cleanup}")
+    # finally:
+    #     if conn_cleanup: conn_cleanup.close()
+    # --- End of Optional Cleanup ---
+
     logging.info("=== Starting Apple Music Multi-Region Scrape ===")
     all_scraped_data = []
     processed_regions = 0
@@ -295,13 +317,13 @@ if __name__ == "__main__":
     for region in REGION_CODES:
         processed_regions += 1
         logging.info(f"--- Processing region {processed_regions}/{total_regions}: {region} ---")
-        region_data = scrape_apple_music_charts(region) # Now returns parsed genres
+        region_data = scrape_apple_music_charts(region)
         if region_data:
             all_scraped_data.extend(region_data)
             logging.info(f"Successfully scraped {len(region_data)} records for region '{region}'.")
         else:
             logging.warning(f"No data scraped for region '{region}'.")
-        time.sleep(1.0) # Sleep between regions
+        time.sleep(0.5)
 
     if all_scraped_data:
         logging.info(f"\n--- Saving {len(all_scraped_data)} total records to database ---")

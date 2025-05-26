@@ -101,200 +101,138 @@ CREATE TABLE IF NOT EXISTS MusicGenres (
 ## Key SQL Logic
 
 *   **Data Integrity:** `UNIQUE(platform, region, rank, date)` in `MusicTop100` prevents duplicate entries for the same rank on the same day/platform/region.
-*   **Efficient Loading:** `INSERT OR IGNORE` is used extensively to add new chart entries, genres, and song-genre links without causing errors if the data already exists.
-*   **Normalization:** The separation into three tables (`MusicTop100`, `Genres`, `MusicGenres`) avoids storing redundant genre names and allows for flexible querying.
+*   **Efficient Loading:** `INSERT OR IGNORE` is used extensively to add new chart entries, artists, songs, genres, and their respective links without causing errors if the data already exists.
+*   **Normalization:** The separation of data into `MusicTop100`, `Artists`, `Songs`, and `Genres` (with `MusicGenres` as a junction table) avoids redundant data storage and allows for flexible querying. Artist and Song names are canonicalized to their `MIN()` value per ID.
+
+## Key SQL Logic
+
+*   **Data Integrity:** `UNIQUE(platform, region, rank, date)` in `MusicTop100` prevents duplicate entries for the same rank on the same day/platform/region.
+*   **Efficient Loading:** `INSERT OR IGNORE` is used extensively to add new chart entries, artists, songs, genres, and their respective links without causing errors if the data already exists.
+*   **Normalization:** The separation of data into `MusicTop100`, `Artists`, `Songs`, and `Genres` (with `MusicGenres` as a junction table) avoids redundant data storage and allows for flexible querying. Artist and Song names are canonicalized to their `MIN()` value per ID.
 
 ## SQL Views for Analysis
 
-The following SQL Views were created directly in the SQLite database to pre-aggregate or reshape data, simplifying analysis in Tableau:
+The following SQL Views were created directly in the SQLite database (`data/music_charts.db`) to pre-aggregate or reshape data, simplifying analysis in Tableau:
 
-*   **`vw_MusicChartsWithGenres`**: Joins chart data with genres, filters out the generic 'Music' category unless it is the only one associated with a song entry (converting those solo 'Music' entries to NULL), and filters to the latest date only.
-    ```   
-    CREATE VIEW vw_MusicChartsWithGenres AS
+*   **`vw_MusicChartsWithGenres`**: This view joins `MusicTop100` (for the latest date) with the `Artists`, `Songs`, and `Genres` lookup tables. It also implements logic to filter out the generic 'Music' category unless it is the only one associated with a song entry, and converts those solo 'Music' entries to NULL for cleaner genre analysis.
+    ```sql
+    CREATE VIEW IF NOT EXISTS vw_MusicChartsWithGenres AS
+    SELECT
+        mt100.id, mt100.platform, mt100.region, mt100.rank,
+        s.song_title, 
+        art.artist_name,
+        mt100.apple_song_id, mt100.apple_artist_id, mt100.release_date,
+        mt100.artwork_url, mt100.song_url, mt100.date AS chart_date,
+        CASE
+            WHEN g.genre_name = 'Music' AND NOT EXISTS (
+                SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
+                WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
+            ) THEN NULL
+            ELSE g.genre_id
+        END AS genre_id,
+        CASE
+            WHEN g.genre_name = 'Music' AND NOT EXISTS (
+                SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
+                WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
+            ) THEN NULL
+            ELSE g.genre_name
+        END AS genre_name,
+        CASE
+            WHEN g.genre_name = 'Music' AND NOT EXISTS (
+                SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
+                WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
+            ) THEN NULL
+            ELSE g.genre_url
+        END AS genre_url
+    FROM MusicTop100 mt100
+    LEFT JOIN Songs s ON mt100.apple_song_id = s.apple_song_id
+    LEFT JOIN Artists art ON mt100.apple_artist_id = art.apple_artist_id
+    LEFT JOIN MusicGenres mg ON mt100.apple_song_id = mg.apple_song_id
+    LEFT JOIN Genres g ON mg.genre_id = g.genre_id
+    WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100) -- Filter for latest date
+        AND (
+            g.genre_name IS NULL OR -- Keep songs with no genre info
+            g.genre_name != 'Music' OR -- Keep all non-'Music' genres
+            (g.genre_name = 'Music' AND NOT EXISTS ( -- If it is 'Music', only keep if no other non-'Music' genre exists
+                SELECT 1
+                FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
+                WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
+            ))
+        )
+    ORDER BY chart_date DESC, platform, region, rank;
+    ```
+*   **`vw_MusicRankChanges_Daily`**: Calculates daily rank changes using `LAG()`, assigning a score (`101-rank`) for new/re-entries based on their current rank if no previous day's rank is found or if the gap is more than one day. This view includes data for all historical dates.
+    ```sql
+    CREATE VIEW IF NOT EXISTS vw_MusicRankChanges_Daily AS
+    WITH RankedData AS (
         SELECT
-            mt100.id,
-            mt100.platform,
-            mt100.region,
-            mt100.rank,
-            mt100.song_title,
-            mt100.artist_name,
-            mt100.apple_song_id,
-            mt100.apple_artist_id,
-            mt100.release_date,
-            mt100.artwork_url,
-            mt100.song_url,
-            mt100.date AS chart_date,
-            -- *** Use CASE statement to conditionally NULL out 'Music' genre details ***
-            CASE
-                WHEN g.genre_name = 'Music' AND NOT EXISTS (
-                    SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
-                    WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
-                ) THEN NULL -- If it's 'Music' AND it's the only genre, set genre_id to NULL
-                ELSE g.genre_id -- Otherwise, keep the original genre_id (which might be non-'Music' or NULL)
-            END AS genre_id,
-            CASE
-                WHEN g.genre_name = 'Music' AND NOT EXISTS (
-                    SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
-                    WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
-                ) THEN NULL -- If it's 'Music' AND it's the only genre, set genre_name to NULL
-                ELSE g.genre_name -- Otherwise, keep the original genre_name
-            END AS genre_name,
-            CASE
-                WHEN g.genre_name = 'Music' AND NOT EXISTS (
-                    SELECT 1 FROM MusicGenres mg2 JOIN Genres g2 ON mg2.genre_id = g2.genre_id
-                    WHERE mg2.apple_song_id = mt100.apple_song_id AND g2.genre_name != 'Music'
-                ) THEN NULL -- If it's 'Music' AND it's the only genre, set genre_url to NULL
-                ELSE g.genre_url -- Otherwise, keep the original genre_url
-            END AS genre_url
+            mt100.date, mt100.platform, mt100.region, s.song_title, art.artist_name, 
+            mt100.apple_song_id, mt100.rank,
+            LAG(mt100.rank, 1) OVER (
+                PARTITION BY mt100.platform, mt100.region, mt100.apple_song_id ORDER BY mt100.date
+            ) as previous_rank,
+            LAG(mt100.date, 1) OVER (
+                PARTITION BY mt100.platform, mt100.region, mt100.apple_song_id ORDER BY mt100.date
+            ) as previous_date
         FROM MusicTop100 mt100
-        -- Joins remain the same
-        LEFT JOIN MusicGenres mg ON mt100.apple_song_id = mg.apple_song_id
-        LEFT JOIN Genres g ON mg.genre_id = g.genre_id
-        -- Optional: Filter for latest date
-        WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100)
-            AND
-            -- The WHERE clause still filters out 'Music' if other genres exist,
-            -- but now it allows the 'Music' rows through if it's the only one,
-            -- so the CASE statements above can handle converting them to NULL.
-            g.genre_name != 'Music'
-            OR
-            (
-                g.genre_name = 'Music'
-                AND NOT EXISTS ( -- Check if any other genre link exists
-                    SELECT 1
-                    FROM MusicGenres mg2
-                    JOIN Genres g2 ON mg2.genre_id = g2.genre_id
-                    WHERE mg2.apple_song_id = mt100.apple_song_id -- For the same song
-                    AND g2.genre_name != 'Music'                -- That is not 'Music'
-                )
-            )
-            OR
-            g.genre_name IS NULL -- Keep rows with no genre info
-        ORDER BY
-            chart_date DESC,
-            platform,
-            region,
-            rank
+        LEFT JOIN Songs s ON mt100.apple_song_id = s.apple_song_id
+        LEFT JOIN Artists art ON mt100.apple_artist_id = art.apple_artist_id
+        WHERE mt100.apple_song_id IS NOT NULL
+    )
+    SELECT
+        date, platform, region, song_title, artist_name, apple_song_id, rank AS current_rank,
+        previous_rank, previous_date,
+        CASE
+            WHEN previous_date IS NOT NULL THEN JULIANDAY(date) - JULIANDAY(previous_date)
+            ELSE NULL
+        END as days_since_previous_rank,
+        CASE
+            WHEN previous_rank IS NULL OR (previous_date IS NOT NULL AND (JULIANDAY(date) - JULIANDAY(previous_date)) > 1) THEN 101 - rank
+            WHEN previous_date IS NOT NULL AND (JULIANDAY(date) - JULIANDAY(previous_date)) = 1 THEN previous_rank - rank
+            ELSE NULL
+        END as rank_change_daily
+    FROM RankedData
+    ORDER BY platform, region, apple_song_id, date DESC;
     ```
-*   **`vw_MusicRankChanges_Daily`**: Calculates daily rank changes using `LAG()`, assigning a score (`101-rank`) for new/re-entries compared to the previous day ranking *if available*. Calculates for all dates.
+*   **`vw_MusicRankChanges_Weekly`**: Calculates weekly rank changes by comparing to data from 7 days prior, assigning a score (`101-rank`) for new/re-entries if no rank was found for the prior week. This view includes data for all historical dates.
+    ```sql
+    CREATE VIEW IF NOT EXISTS vw_MusicRankChanges_Weekly AS -- Renamed from _AllDates_NewLogic for consistency
+    WITH DateMap AS (
+        SELECT date, DATE(date, '-7 days') as date_7_days_ago
+        FROM (SELECT DISTINCT date FROM MusicTop100 ORDER BY date)
+    ),
+    CurrentRanks AS (
+        SELECT mt100.date, mt100.platform, mt100.region, mt100.rank, s.song_title, art.artist_name, mt100.apple_song_id
+        FROM MusicTop100 mt100
+        LEFT JOIN Songs s ON mt100.apple_song_id = s.apple_song_id
+        LEFT JOIN Artists art ON mt100.apple_artist_id = art.apple_artist_id
+        WHERE mt100.apple_song_id IS NOT NULL AND mt100.rank IS NOT NULL
+    ),
+    PreviousWeekRanks AS (
+        SELECT dm.date, t100.platform, t100.region, t100.rank as rank_7_days_ago, t100.apple_song_id
+        FROM MusicTop100 t100
+        JOIN DateMap dm ON t100.date = dm.date_7_days_ago
+        WHERE t100.apple_song_id IS NOT NULL AND t100.rank IS NOT NULL
+    )
+    SELECT
+        cr.date, cr.platform, cr.region, cr.song_title, cr.artist_name, cr.apple_song_id,
+        cr.rank as current_rank, pwr.rank_7_days_ago,
+        CASE
+            WHEN pwr.rank_7_days_ago IS NULL AND cr.rank IS NOT NULL THEN 101 - cr.rank
+            WHEN pwr.rank_7_days_ago IS NOT NULL AND cr.rank IS NOT NULL THEN pwr.rank_7_days_ago - cr.rank
+            ELSE NULL
+        END as rank_change_weekly
+    FROM CurrentRanks cr
+    LEFT JOIN PreviousWeekRanks pwr
+        ON cr.date = pwr.date
+        AND cr.platform = pwr.platform
+        AND cr.region = pwr.region
+        AND cr.apple_song_id = pwr.apple_song_id
+    ORDER BY cr.platform, cr.region, cr.apple_song_id, cr.date DESC;
     ```
-    CREATE VIEW vw_MusicRankChanges_Daily AS
-        WITH RankedData AS (
-            -- Use LAG window function to get the previous day's rank and date
-            SELECT
-                date,
-                platform,
-                region,
-                song_title,
-                artist_name,
-                apple_song_id,
-                rank,
-                LAG(rank, 1) OVER (
-                    PARTITION BY platform, region, apple_song_id
-                    ORDER BY date
-                ) as previous_rank,
-                LAG(date, 1) OVER (
-                    PARTITION BY platform, region, apple_song_id
-                    ORDER BY date
-                ) as previous_date
-            FROM MusicTop100
-            WHERE apple_song_id IS NOT NULL
-        )
-        SELECT
-            date,
-            platform,
-            region,
-            song_title,
-            artist_name,
-            apple_song_id,
-            rank AS current_rank,
-            previous_rank,
-            previous_date,
-            -- Calculate days since last ranking
-            CASE
-                WHEN previous_date IS NOT NULL THEN JULIANDAY(date) - JULIANDAY(previous_date)
-                ELSE NULL -- Represents absolute first appearance in data for this partition
-            END as days_since_previous_rank,
-            -- Calculate rank change:
-            -- Positive = rank improved (number decreased)
-            -- Assign large positive change for new/re-entries
-            CASE
-                -- Condition 1: If it's the first appearance OR re-appearance after a gap (>1 day)
-                WHEN previous_rank IS NULL OR (JULIANDAY(date) - JULIANDAY(previous_date)) > 1 THEN
-                    101 - rank -- Assign change based on entering chart (max possible improvement from rank 100)
-                -- Condition 2: If it ranked consecutively (gap = 1 day)
-                WHEN (JULIANDAY(date) - JULIANDAY(previous_date)) = 1 THEN
-                    previous_rank - rank -- Calculate normal difference
-                -- Condition 3: Should not happen due to logic above, but as fallback
-                ELSE NULL
-            END as rank_change_daily
-        FROM RankedData
-        ORDER BY
-            platform,
-            region,
-            apple_song_id,
-            date DESC
-    ```
-*   **`vw_MusicRankChanges_Weekly`**: Calculates weekly rank changes comparing to 7 days prior using logic involving CTEs and joins, assigning a score (`101-rank`) for new/re-entries within the week *if available*. Calculates for all dates.
-    ```
-    CREATE VIEW vw_MusicRankChanges_Weekly AS
-        WITH DateMap AS (
-            SELECT
-            date,
-            DATE(date, '-7 days') as date_7_days_ago
-            FROM (SELECT DISTINCT date FROM MusicTop100 ORDER BY date)
-        ),
-        CurrentRanks AS (
-            SELECT
-                date, platform, region, rank, song_title, artist_name, apple_song_id
-            FROM MusicTop100
-            WHERE apple_song_id IS NOT NULL AND rank IS NOT NULL -- Added rank check
-        ),
-        PreviousWeekRanks AS (
-            SELECT
-                dm.date,
-                t100.platform,
-                t100.region,
-                t100.rank as rank_7_days_ago,
-                t100.apple_song_id
-            FROM MusicTop100 t100
-            JOIN DateMap dm ON t100.date = dm.date_7_days_ago
-            WHERE t100.apple_song_id IS NOT NULL AND t100.rank IS NOT NULL -- Added rank check
-        )
-        -- Join current ranks with the ranks from 7 days ago
-        SELECT
-            cr.date,
-            cr.platform,
-            cr.region,
-            cr.song_title,
-            cr.artist_name,
-            cr.apple_song_id,
-            cr.rank as current_rank,
-            pwr.rank_7_days_ago,
-            -- Calculate the weekly change with new entry logic - More explicit check
-            CASE
-                WHEN pwr.rank_7_days_ago IS NULL AND cr.rank IS NOT NULL THEN -- Explicitly check current rank is not null
-                    101 - cr.rank -- Assign change score based on entering rank
-                WHEN pwr.rank_7_days_ago IS NOT NULL AND cr.rank IS NOT NULL THEN -- Explicitly check both ranks are not null
-                    pwr.rank_7_days_ago - cr.rank -- Calculate normal difference
-                ELSE -- If current rank is NULL or some other weird case
-                    NULL
-            END as rank_change_weekly
-        FROM CurrentRanks cr
-        LEFT JOIN PreviousWeekRanks pwr
-            ON cr.date = pwr.date
-            AND cr.platform = pwr.platform
-            AND cr.region = pwr.region
-            AND cr.apple_song_id = pwr.apple_song_id
-        ORDER BY
-            cr.platform,
-            cr.region,
-            cr.apple_song_id,
-            cr.date DESC
-    ```
-    *(Note: The `update_music_gsheet.py` script applies a `WHERE date = MAX(date)` filter when querying the Daily and Weekly views to get only the latest changes).*
+    *(Note: The `update_music_gsheet.py` script applies a `WHERE date = (SELECT MAX(date) FROM MusicTop100)` filter when querying the Daily and Weekly rank change views to export only the latest changes to Google Sheets).*
 
-## Setup & Usage
+    ## Setup & Usage
 
 1.  **Prerequisites:** Python 3.x, Git (optional).
 2.  **Clone Repository:** `git clone [URL of your repo]`
@@ -303,8 +241,8 @@ The following SQL Views were created directly in the SQLite database to pre-aggr
 5.  **Install Dependencies:** `pip install -r requirements.txt` (ensure `requests`, `python-dotenv` are listed).
 6.  **(Optional) API Credentials:** Configure using the **`.env` file method** if adding APIs requiring keys in the future. Create `.env` in the project root:
     ```dotenv
-    PODCASTINDEX_API_KEY="YOUR_KEY"
-    PODCASTINDEX_API_SECRET="YOUR_SECRET"
+    # Example for other projects, not strictly needed for Apple Music chart scraper
+    # SOME_API_KEY="YOUR_KEY"
     ```
     *(Ensure `.env` is in your `.gitignore`)*
 7.  **Initial Run:** Execute the main scraping script:
@@ -326,12 +264,12 @@ A Tableau Public dashboard visualizes insights from this global music chart data
 
 **Link:** [**Music Dashboard on Tableau Public**](https://public.tableau.com/app/profile/jason.foreman/viz/MusicDashboard_17463249390320/MusicDashboard)
 
-
+*(Optional: Embed 1-2 compelling screenshots of your dashboard here)*
 
 ## Challenges & Learnings
 
 *   **Multi-Region Data Handling:** Efficiently managing API calls and data storage for over 155 distinct regions, including polite delays.
-*   **Data Normalization:** Successfully implementing a normalized schema for genre data received in a nested format from the API, improving query flexibility.
+*   **Data Normalization:** Successfully implementing a normalized schema for artist, song, and genre data received from the API, improving query flexibility and reducing data redundancy. This involved creating lookup tables (`Artists`, `Songs`, `Genres`) and a junction table (`MusicGenres`).
 *   **Advanced SQL Views:** Crafting complex SQL views with window functions (`LAG`), date manipulation (`DATE`), subqueries (`NOT EXISTS`), and conditional logic (`CASE`) to derive meaningful analytical metrics like rank changes and handle specific data filtering requirements (e.g., the 'Music' genre).
 *   **Tableau Interactivity & Coloring:** Configuring dashboard actions, filters (including context filters), and calculated fields (LODs) to achieve desired cross-sheet filtering behavior (filtering maps by all genres present, not just the dominant one used for coloring) and maintain consistent color legends across different worksheets and calculated fields.
 *   **Troubleshooting:** Debugging issues related to data types (`NaN` in Google Sheets export), filter interactions, specific SQL/Tableau function behaviors, and automation tool integration.
@@ -346,4 +284,5 @@ A Tableau Public dashboard visualizes insights from this global music chart data
 
 ## Contact
 
-Created by **Jason Foreman** - **[[LinkedIn](https://www.linkedin.com/in/foreman-jason/)]**
+Created by **Jason Foreman**
+*   **LinkedIn:** [https://www.linkedin.com/in/foreman-jason/](https://www.linkedin.com/in/foreman-jason/)

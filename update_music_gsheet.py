@@ -5,14 +5,19 @@ import pandas as pd
 import os
 import logging
 import sys
+import math
+from datetime import datetime
+import requests # <<< ADD THIS IMPORT
+
+# ... rest of your script ...
 # No 'math' needed if using pandas fillna
 from datetime import datetime
 
 # --- Configuration ---
 # Path to your Google service account key JSON file
-KEY_FILE_PATH = r"C:\Users\jmfor\Documents\local_song_dashboard\musicdashboard-458520-4318d2e00083.json" # <<< MAKE SURE THIS IS THE CORRECT KEY FOR MUSIC
+KEY_FILE_PATH = r"C:\Users\jmfor\Documents\Portfolio\local_song_dashboard\musicdashboard-458520-4318d2e00083.json" # <<< MAKE SURE THIS IS THE CORRECT KEY FOR MUSIC
 # Path to your SQLite database file for MUSIC data
-DB_PATH = r"C:\Users\jmfor\Documents\local_song_dashboard\data\music_charts.db" # <<< POINTS TO MUSIC DB
+DB_PATH = r"C:\Users\jmfor\Documents\Portfolio\local_song_dashboard\data\music_charts.db" # <<< POINTS TO MUSIC DB
 
 # ID of the Google Sheet
 GOOGLE_SHEET_ID = "19b5Cv_EVnErha0imTRgCJgTpu_S3Q_3XVnyO5QqLIV0" # <<< YOUR SHEET ID
@@ -24,21 +29,64 @@ START_CELL = "A1"
 # Each dictionary maps a SQL query (likely selecting from a view)
 # to the exact name of the worksheet (tab) it should update in Google Sheets.
 QUERY_CONFIGS = [
-    {
-        "query": "SELECT * FROM vw_MusicChartsWithGenres",
-        "worksheet_name": "MusicChartsWithGenres" # Main combined data
+        {
+        # Get MusicTop100 entries ONLY for the latest date
+        "query": """
+            SELECT mt100.id, mt100.region, mt100.rank, mt100.apple_song_id, mt100.apple_artist_id, mt100.release_date
+            FROM MusicTop100 mt100
+            WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100)
+        """,
+        "worksheet_name": "MusicCharts_Latest" # Renamed sheet for clarity
     },
     {
-        "query": "SELECT * FROM vw_MusicRankChanges_Daily WHERE date = (SELECT MAX(date) FROM MusicTop100)",
-        "worksheet_name": "DailyRankChanges" # Tab for daily changes
+        # Daily rank changes already filtered for latest date by its own query
+        "query": "SELECT region, apple_song_id, rank_change_daily FROM vw_MusicRankChanges_Daily WHERE date = (SELECT MAX(date) FROM MusicTop100)",
+        "worksheet_name": "DailyRankChanges"
     },
     {
-        "query": "SELECT * FROM vw_MusicRankChanges_Weekly WHERE date = (SELECT MAX(date) FROM MusicTop100)",
-        "worksheet_name": "WeeklyRankChanges" # Tab for weekly changes
+        # Weekly rank changes already filtered for latest date by its own query
+        "query": "SELECT region, apple_song_id, rank_change_weekly FROM vw_MusicRankChanges_Weekly WHERE date = (SELECT MAX(date) FROM MusicTop100)",
+        "worksheet_name": "WeeklyRankChanges"
     },
     {
+        # Get Artists who have a song in the Top 100 on the latest date
+        "query": """
+            SELECT DISTINCT art.*
+            FROM Artists art
+            JOIN MusicTop100 mt100 ON art.apple_artist_id = mt100.apple_artist_id
+            WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100)
+        """,
+        "worksheet_name": "Artists_Latest" # Renamed sheet for clarity
+    },
+    {
+        # Get Songs that are in the Top 100 on the latest date
+        "query": """
+            SELECT DISTINCT s.*
+            FROM Songs s
+            JOIN MusicTop100 mt100 ON s.apple_song_id = mt100.apple_song_id
+            WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100)
+        """,
+        "worksheet_name": "Songs_Latest" # Renamed sheet for clarity
+    },
+    {
+        # RegionNames is a static lookup, no filtering needed
         "query": "SELECT * FROM RegionNames",
         "worksheet_name": "RegionNames"
+    },
+    {
+        # Genres is also a static lookup, assuming it's populated correctly
+        "query": "SELECT * FROM Genres",
+        "worksheet_name": "Genres"
+    },
+    {
+        # MusicGenres links, only for songs on the latest charts
+         "query": """
+            SELECT DISTINCT mg.*
+            FROM MusicGenres mg
+            JOIN MusicTop100 mt100 ON mg.apple_song_id = mt100.apple_song_id
+            WHERE mt100.date = (SELECT MAX(date) FROM MusicTop100)
+        """,
+        "worksheet_name": "MusicGenres_Latest"
     }
     #{
     #    "query": "SELECT * FROM vw_TimeOnList",
